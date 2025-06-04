@@ -13,3 +13,6 @@
 [submodule "submodules/flow"]
 	path = submodules/flow
 	url = https://github.com/lodestone-rock/flow
+[submodule "flash-attention"]
+	path = flash-attention
+	url = https://github.com/HazyResearch/flash-attention.git

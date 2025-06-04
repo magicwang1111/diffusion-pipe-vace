@@ -3,18 +3,25 @@ import json
 import math
 import re
 import os.path
+from pathlib import Path
+
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/Wan2_1'))
+
+from pathlib import Path
+from deepspeed.utils.logging import logger
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 import safetensors
+from safetensors.torch import load_file
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
 from utils.offloading import ModelOffloader
+from utils.common import is_main_process
 import wan
 from wan.modules.t5 import T5Encoder, T5Decoder, T5Model
 from wan.modules.tokenizers import HuggingfaceTokenizer
@@ -24,37 +31,173 @@ from wan.modules.model import (
 )
 from wan.modules.clip import CLIPModel
 from wan import configs as wan_configs
-from safetensors.torch import load_file
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head', 'modulation']
 
 
 class WanModelFromSafetensors(WanModel):
+    """
+    Fixed version that properly handles config.json loading and dimension validation
+    """
+
     @classmethod
     def from_pretrained(
         cls,
-        weights_file,
-        config_file,
-        torch_dtype=torch.bfloat16,
-        transformer_dtype=torch.bfloat16,
+        ckpt_path: str | os.PathLike,
+        *,
+        torch_dtype: torch.dtype = torch.float16,
+        transformer_dtype: torch.dtype = torch.float16,
+        config_path: str | os.PathLike | None = None,
+        ignore_mismatched: bool = False,
+        **_unused,
     ):
-        with open(config_file, "r", encoding="utf-8") as f:
-            config = json.load(f)
+        import json, textwrap
+        ckpt_path = Path(ckpt_path)
+        
+        # Handle config path resolution
+        if config_path is None:
+            cfg_file = ckpt_path.with_suffix('').parent / "config.json"
+            if not cfg_file.exists():
+                raise FileNotFoundError(
+                    f"[Wan] 未找到 config.json，期望位置: {cfg_file}")
+            config_path = cfg_file
+        else:
+            config_path = Path(config_path)
 
-        config.pop("_class_name", None)
-        config.pop("_diffusers_version", None)
+        # Load and validate config
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg_dict = json.load(f)
 
+        if is_main_process():
+            print(f"[Wan] 原始配置文件内容: {json.dumps(cfg_dict, indent=2)}")
+
+        # 根据模型类型调整期望维度
+        model_type = cfg_dict.get('model_type', 'unknown')
+        config_dim = cfg_dict.get('dim')
+        
+        # 为不同模型类型设置不同的期望维度
+        if model_type == 'vace':
+            expected_dim = 5120  # VACE 模型的维度
+        elif model_type == 'i2v':
+            expected_dim = 5120  # 14B i2v 模型
+        elif model_type == 't2v':
+            # t2v 可能有不同的维度，需要根据实际情况调整
+            expected_dim = config_dim  # 暂时接受配置文件中的值
+        else:
+            expected_dim = config_dim  # 未知类型，接受配置文件中的值
+            
+        if config_dim != expected_dim and model_type == 'vace':
+            raise RuntimeError(
+                f"[Wan] config.json 中的 dim={config_dim} ≠ {expected_dim} (VACE 模型期望值)。"
+                f"请检查配置文件是否正确。")
+
+        # Filter config for WanModel constructor
+        import inspect
+        wan_model_params = set(inspect.signature(WanModel.__init__).parameters.keys())
+        wan_model_params.discard('self')  # Remove 'self' parameter
+        
+        filtered_cfg = {k: v for k, v in cfg_dict.items() if k in wan_model_params}
+        
+        # 强制为 VACE 模型添加 vace_layers 和 vace_in_dim 参数
+        if model_type == 'vace':
+            if 'vace_layers' in cfg_dict:
+                filtered_cfg['vace_layers'] = cfg_dict['vace_layers']
+            if 'vace_in_dim' in cfg_dict:
+                filtered_cfg['vace_in_dim'] = cfg_dict['vace_in_dim']
+        
+        unused_keys = set(cfg_dict.keys()) - wan_model_params - {'_class_name', '_diffusers_version'}
+        
+        if is_main_process():
+            print(f"[Wan] 传递给 WanModel 的参数: {json.dumps(filtered_cfg, indent=2)}")
+            if unused_keys:
+                print(f"[Wan] 未使用的配置键: {unused_keys}")
+
+        # Create model with empty weights
         with init_empty_weights():
-            model = cls(**config)
+            model: WanModel = cls(**filtered_cfg)
 
-        state_dict = load_file(weights_file, device='cpu')
-        state_dict = {
-            re.sub(r'^model\.diffusion_model\.', '', k): v for k, v in state_dict.items()
-        }
+        # Validate model was created correctly
+        if is_main_process():
+            print(f"[Wan] 模型实例化完成 dim={model.dim}")
+            print(f"[Wan] patch_embedding weight shape: {model.patch_embedding.weight.shape}")
 
+        # Sanity check: ensure patch_embedding matches expected dimensions
+        patch_embedding_out_dim = model.patch_embedding.weight.shape[0]
+        if patch_embedding_out_dim != model.dim:
+            raise RuntimeError(
+                f"[Wan] 模型维度不一致: model.dim={model.dim} "
+                f"但 patch_embedding.weight.shape[0]={patch_embedding_out_dim}。"
+                f"请检查 WanModel 构造函数是否正确使用了 dim 参数。")
+
+        # Final validation for 14B model
+        if model.dim != expected_dim:
+            raise RuntimeError(
+                f"[Wan] 模型创建后维度仍然不正确: dim={model.dim} ≠ {expected_dim}。"
+                f"这可能是 WanModel 构造函数的问题。")
+
+        # Load checkpoint weights
+        if is_main_process():
+            print(f"[Wan] 开始加载权重文件: {ckpt_path}")
+        
+        state = safetensors.torch.load_file(str(ckpt_path), device="cpu")
+        current_state = model.state_dict()
+
+        # Track loading statistics
+        loaded_keys = 0
+        skipped_keys = 0
+        mismatched_keys = []
+
+        for name, tensor in state.items():
+            if name not in current_state:
+                if is_main_process():
+                    print(f"[Wan] 跳过不存在的键: {name}")
+                skipped_keys += 1
+                continue
+                
+            if current_state[name].shape != tensor.shape:
+                mismatched_keys.append((name, tensor.shape, current_state[name].shape))
+                if ignore_mismatched:
+                    if is_main_process():
+                        logger.warning(
+                            f"[Wan] 跳过形状不匹配的键 {name}: "
+                            f"ckpt{tuple(tensor.shape)} != model{tuple(current_state[name].shape)}")
+                    skipped_keys += 1
+                    continue
+                else:
+                    raise ValueError(
+                        f"权重形状不匹配 {name}: "
+                        f"checkpoint{tuple(tensor.shape)} vs model{tuple(current_state[name].shape)}")
+
+            # Determine precision for this parameter
+            high_prec = any(k in name for k in KEEP_IN_HIGH_PRECISION)
+            dtype_to_use = torch_dtype if high_prec else transformer_dtype
+            
+            set_module_tensor_to_device(
+                model, name, device="cpu", dtype=dtype_to_use, value=tensor)
+            loaded_keys += 1
+
+        # Fill remaining meta tensors with zeros
+        meta_tensors_filled = 0
         for name, param in model.named_parameters():
-            dtype_to_use = torch_dtype if any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) else transformer_dtype
-            set_module_tensor_to_device(model, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+            if param.device.type == "meta":
+                high_prec = any(k in name for k in KEEP_IN_HIGH_PRECISION)
+                dtype_to_use = torch_dtype if high_prec else transformer_dtype
+                set_module_tensor_to_device(
+                    model, name, device="cpu",
+                    dtype=dtype_to_use,
+                    value=torch.zeros(param.shape, dtype=dtype_to_use))
+                meta_tensors_filled += 1
+
+        # Print loading summary
+        if is_main_process():
+            print(f"[Wan] 权重加载完成:")
+            print(f"  - 成功加载: {loaded_keys} 个参数")
+            print(f"  - 跳过: {skipped_keys} 个参数")
+            print(f"  - 填充元张量: {meta_tensors_filled} 个参数")
+            if mismatched_keys:
+                print(f"  - 形状不匹配的键: {len(mismatched_keys)} 个")
+                for name, ckpt_shape, model_shape in mismatched_keys[:5]:  # Show first 5
+                    print(f"    {name}: ckpt{ckpt_shape} vs model{model_shape}")
 
         return model
 
@@ -223,7 +366,7 @@ class T5EncoderModel:
             state_dict = load_file(checkpoint_path, device='cpu')
             state_dict = umt5_keys_mapping(state_dict)
         else:
-            state_dict = torch.load(checkpoint_path, map_location='cpu')
+            state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=True) 
 
         model.load_state_dict(state_dict, assign=True)
         self.model = model
@@ -380,18 +523,52 @@ class WanPipeline(BasePipeline):
         self.original_model_config_path = os.path.join(ckpt_dir, 'config.json')
         with open(self.original_model_config_path) as f:
             json_config = json.load(f)
-        self.i2v = (json_config['model_type'] == 'i2v')
+        # self.i2v = (json_config['model_type'] == 'i2v')
+        # if self.i2v:
+        #     self.name = 'wan_i2v'
+        # model_dim = json_config['dim']
+        # if not self.i2v and model_dim == 1536:
+        #     wan_config = wan_configs.t2v_1_3B
+        # elif self.i2v and model_dim == 5120:
+        #     wan_config = wan_configs.i2v_14B
+        # elif not self.i2v and model_dim == 5120:
+        #     wan_config = wan_configs.t2v_14B
+        # else:
+        #     raise RuntimeError(f'Could not autodetect model variant. model_dim={model_dim}, i2v={self.i2v}')
+
+        # ─────────────────── 读取 config.json ───────────────────
+        with open(self.original_model_config_path, "r", encoding="utf-8") as f:
+            json_config = json.load(f)
+
+        model_type = json_config.get("model_type", "unknown")
+        self.i2v  = (model_type == "i2v")
+        self.vace = (model_type == "vace")          # 新增 VACE 判定
+
+        # 根据类型给 pipeline 起名字（仅用于日志）
         if self.i2v:
-            self.name = 'wan_i2v'
-        model_dim = json_config['dim']
-        if not self.i2v and model_dim == 1536:
+            self.name = "wan_i2v"
+        elif self.vace:
+            self.name = "wan_vace"
+        else:
+            self.name = "wan_t2v"
+
+        model_dim = json_config["dim"]
+
+        # ─────────────────── 选择内置超参配置 ───────────────────
+        if self.vace and model_dim == 5120:
+            # 目前 VACE 共用 i2v_14B 这份超参；后续可换成官方 vace_config
+            wan_config = wan_configs.i2v_14B
+        elif (not self.i2v) and model_dim == 1536:
             wan_config = wan_configs.t2v_1_3B
         elif self.i2v and model_dim == 5120:
             wan_config = wan_configs.i2v_14B
-        elif not self.i2v and model_dim == 5120:
+        elif (not self.i2v) and model_dim == 5120:
             wan_config = wan_configs.t2v_14B
         else:
-            raise RuntimeError(f'Could not autodetect model variant. model_dim={model_dim}, i2v={self.i2v}')
+            raise RuntimeError(
+                f"Unable to autodetect model variant: model_type={model_type}, dim={model_dim}"
+            )
+
 
         # This is the outermost class, which isn't a nn.Module
         t5_model_path = self.model_config['llm_path'] if self.model_config.get('llm_path', None) else os.path.join(ckpt_dir, wan_config.t5_checkpoint)
@@ -428,22 +605,25 @@ class WanPipeline(BasePipeline):
         dtype = self.model_config['dtype']
         transformer_dtype = self.model_config.get('transformer_dtype', dtype)
 
-        if transformer_path := self.model_config.get('transformer_path', None):
+        transformer_path = self.model_config.get('transformer_path')
+        if transformer_path:
             self.transformer = WanModelFromSafetensors.from_pretrained(
-                transformer_path,
-                self.original_model_config_path,
-                torch_dtype=dtype,
-                transformer_dtype=transformer_dtype,
+            "/mnt/data/shared_data/ComfyuiModels/diffusion_models/wan/wan2.1_vace_14B_fp16.safetensors",
+            torch_dtype=dtype,
+            transformer_dtype=transformer_dtype,
+            config_path="/mnt/data/shared_data/ComfyuiModels/diffusion_models/wan/config.json",
+                ignore_mismatched=True, 
             )
         else:
-            self.transformer = WanModel.from_pretrained(self.model_config['ckpt_path'], torch_dtype=dtype)
+            # 兼容旧 ckpt 目录加载
+            self.transformer = WanModel.from_pretrained(
+                self.model_config['ckpt_path'], torch_dtype=dtype
+            )
             for name, p in self.transformer.named_parameters():
-                if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
+                if not any(x in name for x in KEEP_IN_HIGH_PRECISION):
                     p.data = p.data.to(transformer_dtype)
 
         self.transformer.train()
-        # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
-        # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
         for name, p in self.transformer.named_parameters():
             p.original_name = name
 
@@ -605,14 +785,33 @@ class WanPipeline(BasePipeline):
 class InitialLayer(nn.Module):
     def __init__(self, model):
         super().__init__()
+
+        # 公共组件
         self.patch_embedding = model.patch_embedding
-        self.time_embedding = model.time_embedding
-        self.text_embedding = model.text_embedding
+        self.time_embedding  = model.time_embedding
+        self.text_embedding  = model.text_embedding
         self.time_projection = model.time_projection
-        self.i2v = (model.model_type == 'i2v')
-        if self.i2v:
-            self.img_emb = model.img_emb
+
+        # 判断模型类型
+        model_type = getattr(model, "model_type", "unknown")
+        self.i2v  = (model_type == "i2v")
+        self.vace = (model_type == "vace")
+
+        # -------- 基本超参 (来自 transformer) --------
+        self.dim       = model.dim
+        self.freq_dim  = model.freq_dim        # rope 频率维度
+        self.text_len  = model.text_len
+        self.freqs     = model.freqs           # 1024 x (dim/num_heads/2) 张量
+
+        # 针对不同类型挂载额外组件（若存在）
+        if self.i2v and hasattr(model, "img_emb"):
+            self.img_emb = model.img_emb          # i2v 专有
+        if self.vace and hasattr(model, "vace_emb"):
+            self.vace_emb = model.vace_emb        # VACE 可能存在
+
+        # 保留对完整模型的引用，便于 __getattr__
         self.model = [model]
+
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)

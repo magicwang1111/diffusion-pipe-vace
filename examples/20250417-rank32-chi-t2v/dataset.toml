@@ -1,0 +1,10 @@
+resolutions = [[1280, 720]]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+frame_buckets = [61,97]
+
+[[directory]]
+path = '/home/wangxi/diffusion-pipe/dataset/20250417chi处理后v4已打标'
+num_repeats = 5

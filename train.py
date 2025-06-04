@@ -11,6 +11,16 @@ from pathlib import Path
 
 import toml
 import deepspeed
+# === train.py 顶部 shim (插在 import deepspeed 之后) ===
+import torch.distributed as dist
+
+# 如果还没初始化过，就先用 GLOO 建个 PG，
+# 这样 dataset_manager.cache() 的 broadcast_object_list 就走 Gloo
+if not dist.is_initialized():
+    # env:// 会自动用 MASTER_ADDR/MASTER_PORT、RANK、WORLD_SIZE
+    dist.init_process_group(backend='gloo', init_method='env://')
+# ========================================================
+
 from deepspeed import comm as dist
 from deepspeed.runtime.pipe import module as ds_pipe_module
 import torch
@@ -28,6 +38,11 @@ from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+
+
+# import torch.distributed as dist, deepspeed
+# if not dist.is_initialized():
+#     deepspeed.init_distributed(backend='gloo')
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 

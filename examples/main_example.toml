@@ -32,7 +32,7 @@ warmup_steps = 100
 
 # eval settings
 
-eval_every_n_epochs = 1
+eval_every_n_epochs = 5
 eval_before_first_step = true
 # Might want to set these lower for eval so that less images get dropped (eval dataset size is usually much smaller than training set).
 # Each size bucket of images/videos is rounded down to the nearest multiple of the global batch size, so higher global batch size means
